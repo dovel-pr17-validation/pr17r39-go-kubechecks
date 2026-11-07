@@ -1,0 +1,86 @@
+package vcs
+
+import (
+	"context"
+	"net/http"
+
+	"github.com/zapier/kubechecks/pkg"
+	"github.com/zapier/kubechecks/pkg/msg"
+)
+
+type WebHookConfig struct {
+	Url       string
+	SecretKey string
+	Events    []string
+}
+
+// Client represents a VCS client
+type Client interface {
+	// PostMessage takes in project name in form "owner/repo" (ie zapier/kubechecks), the PR/MR id, and the actual message
+	PostMessage(context.Context, PullRequest, string) (*msg.Message, error)
+	// UpdateMessage update a message with new content. Content that does not fit in one comment
+	// arrives as several chunks: the first replaces the message, the rest are posted after it.
+	UpdateMessage(ctx context.Context, pr PullRequest, noteID int, chunks []string) error
+	// DeleteMessage removes a message posted by PostMessage. Used to take back a
+	// placeholder comment when the finished run turned out to have nothing to report.
+	DeleteMessage(ctx context.Context, pr PullRequest, noteID int) error
+	// VerifyHook validates a webhook secret and return the body; must be called even if no secret
+	VerifyHook(*http.Request, string) ([]byte, error)
+	// ParseHook parses webook payload for valid events, with context for request-scoped values
+	ParseHook(context.Context, *http.Request, []byte) (PullRequest, error)
+	// CommitStatus sets a status for a specific commit on the remote VCS
+	CommitStatus(context.Context, PullRequest, pkg.CommitState) error
+	// GetHookByUrl gets a webhook by url
+	GetHookByUrl(ctx context.Context, repoName, webhookUrl string) (*WebHookConfig, error)
+	// CreateHook creates a webhook that points at kubechecks
+	CreateHook(ctx context.Context, repoName, webhookUrl, webhookSecret string) error
+	// GetName returns the VCS client name (e.g. "github" or "gitlab")
+	GetName() string
+	// TidyOutdatedComments either by hiding or deleting them
+	TidyOutdatedComments(context.Context, PullRequest) error
+	// LoadHook creates an EventRequest from the ID of an actual request
+	LoadHook(ctx context.Context, repoAndId string) (PullRequest, error)
+
+	// GetPullRequestFiles returns the list of files changed in a pull request
+	// Returns slice of file paths relative to repository root
+	GetPullRequestFiles(ctx context.Context, pr PullRequest) ([]string, error)
+	// DownloadArchive downloads a repository archive for a specific commit SHA
+	// Returns the archive URL that can be used to download the zip file
+	DownloadArchive(ctx context.Context, pr PullRequest) (string, error)
+	// GetAuthHeaders returns HTTP headers needed for authenticated archive downloads.
+	// For GitHub App auth, this fetches a fresh installation token, so the call may
+	// perform a network request and must be passed a context.
+	GetAuthHeaders(ctx context.Context) (map[string]string, error)
+	// GitCredentials returns HTTP basic-auth credentials (username, password) for
+	// git-over-HTTPS operations such as cloning policy and schema repositories. As with
+	// GetAuthHeaders, the password may be a short-lived token resolved per call, so this
+	// may perform a network request and must be passed a context.
+	GitCredentials(ctx context.Context) (username, password string, err error)
+
+	// PostReviewSuggestions posts a PR review with inline code suggestions.
+	// Each suggestion targets a specific file+line in the PR diff.
+	PostReviewSuggestions(ctx context.Context, pr PullRequest, summary string, suggestions []ReviewSuggestion) error
+
+	// MaxCommentLength returns the maximum allowed comment length for this VCS provider
+	MaxCommentLength() int
+
+	Username() string
+	CloneUsername() string
+	Email() string
+	ToEmoji(pkg.CommitState) string
+}
+
+// ReviewSuggestion represents a code suggestion to post on a specific file+line in a PR.
+type ReviewSuggestion struct {
+	Path       string // file path in the PR
+	StartLine  int    // first line for multi-line suggestion (0 = single line)
+	EndLine    int    // line number in the PR diff (RIGHT side)
+	Body       string // explanation text
+	Suggestion string // corrected code
+}
+
+// AIReviewResult holds the result of an AI review including any code suggestions.
+type AIReviewResult struct {
+	Result      msg.Result
+	Suggestions []ReviewSuggestion
+}

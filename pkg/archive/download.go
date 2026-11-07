@@ -1,0 +1,330 @@
+package archive
+
+import (
+	"archive/zip"
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/rs/zerolog/log"
+)
+
+// HTTPError is returned when the archive server responds with a non-200 status code.
+// It carries the status code so callers can make retry decisions without string parsing.
+// Note: Body contains the raw response snippet and may include sensitive server data —
+// it is intentionally kept out of user-facing PR comments and used only in internal logs.
+type HTTPError struct {
+	StatusCode int
+	URL        string
+	Body       string
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("HTTP %d %s - URL: %s - Response: %s",
+		e.StatusCode, http.StatusText(e.StatusCode), e.URL, e.Body)
+}
+
+// extractError wraps failures that occur during local zip extraction.
+// These are never retriable — retrying the download won't fix zip corruption,
+// path traversal violations, permission errors, or out-of-disk-space conditions.
+type extractError struct{ err error }
+
+func (e *extractError) Error() string { return e.err.Error() }
+func (e *extractError) Unwrap() error { return e.err }
+
+// Downloader handles downloading and extracting archives
+type Downloader struct {
+	httpClient *http.Client
+}
+
+// NewDownloader creates a new archive downloader
+func NewDownloader() *Downloader {
+	return &Downloader{
+		httpClient: &http.Client{
+			Timeout: 0, // No timeout, let context handle it
+		},
+	}
+}
+
+// DownloadAndExtract downloads an archive from URL and extracts it to targetDir
+// Returns the path to the extracted directory
+func (d *Downloader) DownloadAndExtract(ctx context.Context, archiveURL, targetDir string, authHeaders map[string]string) (string, error) {
+	log.Debug().
+		Caller().
+		Str("url", archiveURL).
+		Str("target_dir", targetDir).
+		Msg("downloading and extracting archive")
+
+	// Download archive
+	zipData, err := d.download(ctx, archiveURL, authHeaders)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to download archive")
+	}
+
+	// Extract archive.
+	// Note: extract() does not take a context — cancellation during extraction (a local
+	// disk operation) is not supported and will run to completion regardless of ctx state.
+	// Extraction failures are wrapped in extractError so isRetriableDownloadError can
+	// distinguish them from transient download failures and skip retries.
+	extractedPath, err := d.extract(zipData, targetDir)
+	if err != nil {
+		return "", &extractError{err: errors.Wrap(err, "failed to extract archive")}
+	}
+
+	log.Info().
+		Str("url", archiveURL).
+		Str("extracted_path", extractedPath).
+		Msg("archive downloaded and extracted successfully")
+
+	return extractedPath, nil
+}
+
+// download downloads archive from URL
+func (d *Downloader) download(ctx context.Context, archiveURL string, authHeaders map[string]string) ([]byte, error) {
+	archiveDownloadTotal.Inc()
+	timer := prometheus.NewTimer(archiveDownloadDuration)
+	defer timer.ObserveDuration()
+
+	// Create request
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, archiveURL, nil)
+	if err != nil {
+		archiveDownloadFailed.Inc()
+		return nil, errors.Wrap(err, "failed to create request")
+	}
+
+	// Add authentication headers
+	for key, value := range authHeaders {
+		req.Header.Set(key, value)
+	}
+
+	// Execute request
+	resp, err := d.httpClient.Do(req)
+	if err != nil {
+		archiveDownloadFailed.Inc()
+		return nil, errors.Wrap(err, "failed to download archive")
+	}
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			log.Warn().Err(closeErr).Msg("failed to close response body")
+		}
+	}()
+
+	// Log response details for debugging
+	log.Debug().
+		Caller().
+		Str("url", archiveURL).
+		Int("status_code", resp.StatusCode).
+		Str("content_type", resp.Header.Get("Content-Type")).
+		Int64("content_length", resp.ContentLength).
+		Msg("received HTTP response")
+
+	// Read response body first (needed for both success and error cases)
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		archiveDownloadFailed.Inc()
+		return nil, errors.Wrap(err, "failed to read response body")
+	}
+
+	// Log actual data received (first 16 bytes as hex for debugging)
+	previewLen := 16
+	if len(data) < previewLen {
+		previewLen = len(data)
+	}
+	log.Debug().
+		Caller().
+		Str("url", archiveURL).
+		Int("bytes_read", len(data)).
+		Str("first_bytes_hex", fmt.Sprintf("%x", data[:previewLen])).
+		Msg("read response body")
+
+	// Check status code
+	if resp.StatusCode != http.StatusOK {
+		archiveDownloadFailed.Inc()
+		bodySnippet := string(data)
+		if len(bodySnippet) > 500 {
+			bodySnippet = bodySnippet[:500] + "..."
+		}
+		return nil, &HTTPError{StatusCode: resp.StatusCode, URL: archiveURL, Body: bodySnippet}
+	}
+
+	archiveDownloadSuccess.Inc()
+	archiveDownloadSizeBytes.Observe(float64(len(data)))
+
+	log.Debug().
+		Caller().
+		Str("url", archiveURL).
+		Int("size_bytes", len(data)).
+		Msg("archive downloaded")
+
+	return data, nil
+}
+
+// extract extracts zip archive to target directory
+// Returns the path to the extracted content (strips top-level directory if present)
+func (d *Downloader) extract(zipData []byte, targetDir string) (string, error) {
+	archiveExtractTotal.Inc()
+	timer := prometheus.NewTimer(archiveExtractDuration)
+	defer timer.ObserveDuration()
+
+	// Create temp file for zip data
+	tmpFile, err := os.CreateTemp("", "kubechecks-archive-*.zip")
+	if err != nil {
+		archiveExtractFailed.Inc()
+		return "", errors.Wrap(err, "failed to create temp file")
+	}
+	defer func() {
+		if removeErr := os.Remove(tmpFile.Name()); removeErr != nil {
+			log.Warn().Err(removeErr).Str("file", tmpFile.Name()).Msg("failed to remove temp file")
+		}
+	}()
+	// Note: We explicitly close tmpFile below (before opening zip reader), so no defer close needed
+
+	// Write zip data to temp file
+	if _, err := tmpFile.Write(zipData); err != nil {
+		archiveExtractFailed.Inc()
+		return "", errors.Wrap(err, "failed to write zip data")
+	}
+
+	// Close temp file so we can read it
+	if err := tmpFile.Close(); err != nil {
+		archiveExtractFailed.Inc()
+		return "", errors.Wrap(err, "failed to close temp file")
+	}
+
+	// Open zip file for reading
+	zipReader, err := zip.OpenReader(tmpFile.Name())
+	if err != nil {
+		archiveExtractFailed.Inc()
+		return "", errors.Wrap(err, "failed to open zip file")
+	}
+	defer func() {
+		if closeErr := zipReader.Close(); closeErr != nil {
+			log.Warn().Err(closeErr).Msg("failed to close zip reader")
+		}
+	}()
+
+	// Create target directory
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		archiveExtractFailed.Inc()
+		return "", errors.Wrap(err, "failed to create target directory")
+	}
+
+	// Track top-level directory (GitHub/GitLab archives have a top-level folder)
+	var topLevelDir string
+	fileCount := 0
+
+	// Extract all files
+	for _, file := range zipReader.File {
+		fileCount++
+
+		// Track top-level directory
+		if topLevelDir == "" {
+			parts := strings.SplitN(file.Name, "/", 2)
+			if len(parts) > 0 && file.FileInfo().IsDir() {
+				topLevelDir = parts[0]
+			}
+		}
+
+		// Extract file
+		if err := d.extractFile(file, targetDir); err != nil {
+			archiveExtractFailed.Inc()
+			return "", errors.Wrapf(err, "failed to extract file: %s", file.Name)
+		}
+	}
+
+	archiveExtractSuccess.Inc()
+
+	log.Debug().
+		Caller().
+		Str("target_dir", targetDir).
+		Int("file_count", fileCount).
+		Str("top_level_dir", topLevelDir).
+		Msg("archive extracted")
+
+	// Return path to actual content (strip top-level directory)
+	if topLevelDir != "" {
+		return filepath.Join(targetDir, topLevelDir), nil
+	}
+	return targetDir, nil
+}
+
+// isRetriableDownloadError returns true if the error is transient and the download should be retried.
+// Returns false for context cancellation, permanent HTTP errors (4xx except 404/429), or nil.
+func isRetriableDownloadError(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() != nil {
+		return false
+	}
+	// Local extraction failures (zip corruption, path traversal, disk full, permissions) are
+	// never transient — the same archive would produce the same failure on retry.
+	var extErr *extractError
+	if errors.As(err, &extErr) {
+		return false
+	}
+	var httpErr *HTTPError
+	if errors.As(err, &httpErr) {
+		sc := httpErr.StatusCode
+		// 404: archive may not be ready on CDN yet; 429: rate limited; 5xx: transient server errors
+		return sc == http.StatusNotFound ||
+			sc == http.StatusTooManyRequests ||
+			sc >= http.StatusInternalServerError
+	}
+	// Non-HTTP errors are network-level failures (connection refused, timeouts) — transient
+	return true
+}
+
+// extractFile extracts a single file from zip archive
+func (d *Downloader) extractFile(file *zip.File, targetDir string) error {
+	// Create full path
+	path := filepath.Join(targetDir, file.Name)
+
+	// Prevent path traversal
+	rel, err := filepath.Rel(filepath.Clean(targetDir), path)
+	if err != nil || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || rel == ".." || filepath.IsAbs(rel) {
+		return fmt.Errorf("invalid file path (path traversal detected): %s", file.Name)
+	}
+
+	// Create directory for file
+	if file.FileInfo().IsDir() {
+		return os.MkdirAll(path, file.Mode())
+	}
+
+	// Create parent directories
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+
+	// Open file in zip
+	srcFile, err := file.Open()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := srcFile.Close(); closeErr != nil {
+			log.Warn().Err(closeErr).Str("file", file.Name).Msg("failed to close source file")
+		}
+	}()
+
+	// Create destination file
+	dstFile, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, file.Mode())
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := dstFile.Close(); closeErr != nil {
+			log.Warn().Err(closeErr).Str("path", path).Msg("failed to close destination file")
+		}
+	}()
+
+	// Copy contents
+	if _, err := io.Copy(dstFile, srcFile); err != nil {
+		return err
+	}
+
+	return nil
+}

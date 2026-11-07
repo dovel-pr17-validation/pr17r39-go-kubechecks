@@ -1,0 +1,425 @@
+package diff
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"strings"
+	"time"
+
+	"github.com/argoproj/argo-cd/gitops-engine/pkg/diff"
+	"github.com/argoproj/argo-cd/gitops-engine/pkg/sync/hook"
+	"github.com/argoproj/argo-cd/gitops-engine/pkg/sync/ignore"
+	"github.com/argoproj/argo-cd/gitops-engine/pkg/utils/kube"
+	cmdutil "github.com/argoproj/argo-cd/v3/cmd/util"
+	"github.com/argoproj/argo-cd/v3/controller"
+	"github.com/argoproj/argo-cd/v3/pkg/apiclient/application"
+	"github.com/argoproj/argo-cd/v3/pkg/apiclient/settings"
+	argoappv1 "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
+	"github.com/argoproj/argo-cd/v3/util/argo"
+	argodiff "github.com/argoproj/argo-cd/v3/util/argo/diff"
+	"github.com/argoproj/argo-cd/v3/util/argo/normalizers"
+	"github.com/ghodss/yaml"
+	"github.com/go-logr/logr"
+	"github.com/go-logr/zerologr"
+	"github.com/pmezard/go-difflib/difflib"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+
+	"github.com/zapier/kubechecks/pkg"
+	"github.com/zapier/kubechecks/pkg/checks"
+	"github.com/zapier/kubechecks/pkg/msg"
+	"github.com/zapier/kubechecks/telemetry"
+)
+
+// newDiffLogger creates a logr.Logger for the diff engine that suppresses V(1) debug noise.
+// gitops-engine logs CRD scheme warnings at V(1) which are harmless but noisy.
+// This creates a zerolog logger at WarnLevel so only warnings/errors pass through.
+func newDiffLogger() logr.Logger {
+	diffLogger := log.Logger.Level(zerolog.WarnLevel)
+	return zerologr.New(&diffLogger)
+}
+
+// from https://github.com/argoproj/argo-cd/blob/d3ff9757c460ae1a6a11e1231251b5d27aadcdd1/cmd/argocd/commands/app.go#L879
+type objKeyLiveTarget struct {
+	key    kube.ResourceKey
+	live   *unstructured.Unstructured
+	target *unstructured.Unstructured
+}
+
+func isAppMissingErr(err error) bool {
+	return strings.Contains(err.Error(), "PermissionDenied")
+}
+
+/*
+Check takes cli output and return as a string or an array of strings instead of printing
+
+changedFilePath should be the root of the changed folder
+
+from https://github.com/argoproj/argo-cd/blob/d3ff9757c460ae1a6a11e1231251b5d27aadcdd1/cmd/argocd/commands/app.go#L879
+*/
+func Check(ctx context.Context, request checks.Request) (msg.Result, error) {
+	ctx, span := tracer.Start(ctx, "getDiff")
+	defer span.End()
+
+	app := request.App
+
+	log.Debug().Caller().Str("name", app.Name).Msg("generating diff for application...")
+
+	items := make([]objKeyLiveTarget, 0)
+	var unstructureds []*unstructured.Unstructured
+	for _, mfst := range request.JsonManifests {
+		obj, err := argoappv1.UnmarshalToUnstructured(mfst)
+		if err != nil {
+			log.Warn().Err(err).Msg("failed to unmarshal to unstructured")
+			continue
+		}
+
+		unstructureds = append(unstructureds, obj)
+	}
+
+	argoSettings, err := getArgoSettings(ctx, request)
+	if err != nil {
+		return msg.Result{}, err
+	}
+
+	resources, err := getResources(ctx, request)
+	if err != nil {
+		return msg.Result{}, err
+	}
+
+	liveObjs, err := cmdutil.LiveObjects(resources)
+	if err != nil {
+		telemetry.SetError(span, err, "Get Argo Live Objects")
+		return msg.Result{}, err
+	}
+
+	groupedObjs, err := groupObjsByKey(unstructureds, liveObjs, app.Spec.Destination.Namespace)
+	if err != nil {
+		return msg.Result{}, err
+	}
+
+	if items, err = groupObjsForDiff(resources, groupedObjs, items, argoSettings, appInstanceName(request, argoSettings), app.Spec.Destination.Namespace); err != nil {
+		return msg.Result{}, err
+	}
+
+	var diffBuffer strings.Builder
+	var added, modified, removed int
+	for _, item := range items {
+		resourceId := fmt.Sprintf("%s/%s %s/%s", item.key.Group, item.key.Kind, item.key.Namespace, item.key.Name)
+		log.Trace().Str("resource", resourceId).Msg("diffing object")
+
+		if item.target != nil && hook.IsHook(item.target) || item.live != nil && hook.IsHook(item.live) {
+			continue
+		}
+
+		diffRes, err := generateDiff(ctx, request, argoSettings, item)
+		if err != nil {
+			return msg.Result{}, err
+		}
+
+		if diffRes.Modified || item.target == nil || item.live == nil {
+			err := addResourceDiffToMessage(ctx, &diffBuffer, resourceId, item, diffRes)
+			if err != nil {
+				return msg.Result{}, err
+			}
+
+			processResources(item, diffRes, request, &added, &modified, &removed)
+		}
+	}
+
+	var cr msg.Result
+
+	if added != 0 || modified != 0 || removed != 0 {
+		cr.Summary = fmt.Sprintf("%d added, %d modified, %d removed", added, modified, removed)
+	} else {
+		cr.Summary = "No changes"
+		cr.NoChangesDetected = true
+	}
+
+	renderedDiff := diffBuffer.String()
+
+	cr.Details = fmt.Sprintf("```diff\n%s\n```", renderedDiff)
+
+	if request.Container.Config.EnableAIDiffSummary {
+		aiDiffSummary(ctx, request.Note, request.Container.Config, request.AppName, renderedDiff)
+	}
+
+	return cr, nil
+}
+
+func processResources(item objKeyLiveTarget, diffRes diff.DiffResult, request checks.Request, added, modified, removed *int) {
+	switch {
+	case item.target == nil:
+		*removed++
+		if app, ok := isApp(item, diffRes.NormalizedLive); ok {
+			request.RemoveApp(app)
+		}
+	case item.live == nil:
+		*added++
+		if app, ok := isApp(item, diffRes.PredictedLive); ok {
+			request.QueueApp(app)
+		}
+	case diffRes.Modified:
+		*modified++
+		if app, ok := isApp(item, diffRes.PredictedLive); ok {
+			request.QueueApp(app)
+		}
+	}
+}
+
+func addResourceDiffToMessage(ctx context.Context, diffBuffer *strings.Builder, resourceId string, item objKeyLiveTarget, diffRes diff.DiffResult) error {
+	_, span := tracer.Start(ctx, "addResourceDiffToMessage")
+	defer span.End()
+
+	fmt.Fprintf(diffBuffer, "===== %s ======\n", resourceId)
+
+	var live *unstructured.Unstructured
+	var target *unstructured.Unstructured
+	if item.target != nil && item.live != nil {
+		target = &unstructured.Unstructured{}
+		live = item.live
+		if err := json.Unmarshal(diffRes.PredictedLive, target); err != nil {
+			telemetry.SetError(span, err, "JSON Unmarshall")
+			log.Warn().Err(err).Msg("failed to unmarshall json")
+		}
+	} else {
+		live = item.live
+		target = item.target
+	}
+
+	err := PrintDiff(diffBuffer, live, target)
+	if err != nil {
+		telemetry.SetError(span, err, "Print Diff")
+		return err
+	}
+
+	return nil
+}
+
+func generateDiff(ctx context.Context, request checks.Request, argoSettings *settings.Settings, item objKeyLiveTarget) (diff.DiffResult, error) {
+	_, span := tracer.Start(ctx, "getResources")
+	defer span.End()
+
+	overrides := make(map[string]argoappv1.ResourceOverride)
+	for k := range argoSettings.ResourceOverrides {
+		val := argoSettings.ResourceOverrides[k]
+		overrides[k] = *val
+	}
+
+	ignoreAggregatedRoles := false
+	ignoreNormalizerOpts := normalizers.IgnoreNormalizerOpts{
+		JQExecutionTimeout: 1 * time.Second,
+	}
+	diffConfig, err := argodiff.NewDiffConfigBuilder().
+		WithLogger(newDiffLogger()).
+		WithDiffSettings(request.App.Spec.IgnoreDifferences, overrides, ignoreAggregatedRoles, ignoreNormalizerOpts).
+		WithTracking(argoSettings.AppLabelKey, argoSettings.TrackingMethod).
+		WithNoCache().
+		Build()
+	if err != nil {
+		telemetry.SetError(span, err, "Build Diff")
+		return diff.DiffResult{}, err
+	}
+
+	diffRes, err := argodiff.StateDiff(item.live, item.target, diffConfig)
+	if err != nil {
+		telemetry.SetError(span, err, "State Diff")
+		return diff.DiffResult{}, err
+	}
+	return diffRes, nil
+}
+
+func getResources(ctx context.Context, request checks.Request) ([]*argoappv1.ResourceDiff, error) {
+	ctx, span := tracer.Start(ctx, "getResources")
+	defer span.End()
+
+	closer, appClient := request.Container.ArgoClient.GetApplicationClient()
+	defer pkg.WithErrorLogging(closer.Close, "failed to close application connection")
+
+	resources, err := appClient.ManagedResources(ctx, &application.ResourcesQuery{
+		ApplicationName: &request.App.Name,
+		AppNamespace:    &request.App.Namespace,
+	})
+	if err != nil {
+		if isAppMissingErr(err) {
+			span.RecordError(err)
+			return nil, nil
+		}
+
+		return nil, err
+	}
+	return resources.Items, nil
+}
+
+// appInstanceName returns the app instance name exactly as Argo CD records it in
+// resource tracking ids. Under apps-in-any-namespace an Application living outside
+// the Argo CD controller namespace is qualified as `<appNamespace>_<appName>`, so
+// diffing against the bare name reports a tracking-id change on every resource of
+// every such app.
+func appInstanceName(request checks.Request, argoSettings *settings.Settings) string {
+	controllerNamespace := argoSettings.GetControllerNamespace()
+	if controllerNamespace == "" {
+		controllerNamespace = request.Container.Config.ArgoCDNamespace
+	}
+	return request.App.InstanceName(controllerNamespace)
+}
+
+func getArgoSettings(ctx context.Context, request checks.Request) (*settings.Settings, error) {
+	ctx, span := tracer.Start(ctx, "getArgoSettings")
+	defer span.End()
+
+	settingsCloser, settingsClient := request.Container.ArgoClient.GetSettingsClient()
+	defer pkg.WithErrorLogging(settingsCloser.Close, "failed to close connection")
+
+	argoSettings, err := settingsClient.Get(ctx, &settings.SettingsQuery{})
+	if err != nil {
+		telemetry.SetError(span, err, "Get Argo Cluster Settings")
+		return nil, err
+	}
+	return argoSettings, nil
+}
+
+var nilApp = argoappv1.Application{}
+
+func isApp(item objKeyLiveTarget, manifests []byte) (argoappv1.Application, bool) {
+	logger := log.With().Caller().
+		Str("kind", item.key.Kind).
+		Str("name", item.key.Name).
+		Str("namespace", item.key.Namespace).
+		Str("group", item.key.Group).
+		Logger()
+
+	if strings.ToLower(item.key.Group) != "argoproj.io" {
+		logger.Debug().Msg("group is not correct")
+		return nilApp, false
+	}
+	if strings.ToLower(item.key.Kind) != "application" {
+		logger.Debug().Msg("kind is not correct")
+		return nilApp, false
+	}
+
+	var app argoappv1.Application
+	if err := json.Unmarshal(manifests, &app); err != nil {
+		logger.Warn().Err(err).Msg("failed to deserialize application")
+		return nilApp, false
+	}
+
+	return app, true
+}
+
+// from https://github.com/argoproj/argo-cd/blob/d3ff9757c460ae1a6a11e1231251b5d27aadcdd1/cmd/argocd/commands/app.go#L879
+func groupObjsByKey(localObs []*unstructured.Unstructured, liveObjs []*unstructured.Unstructured, appNamespace string) (map[kube.ResourceKey]*unstructured.Unstructured, error) {
+	namespacedByGk := make(map[schema.GroupKind]bool)
+	for i := range liveObjs {
+		if liveObjs[i] != nil {
+			key := kube.GetResourceKey(liveObjs[i])
+			namespacedByGk[schema.GroupKind{Group: key.Group, Kind: key.Kind}] = key.Namespace != ""
+		}
+	}
+	// argo-cd v3.5 renamed DeduplicateTargetObjects to NormalizeTargetObjects and added a
+	// setAppInstance callback. It only fires when a namespace was corrected, which the old
+	// dedup-only function never did, so a no-op keeps the previous behaviour.
+	localObs, _, err := controller.NormalizeTargetObjects(appNamespace, localObs, &resourceInfoProvider{namespacedByGk: namespacedByGk}, func(*unstructured.Unstructured) error { return nil })
+	if err != nil {
+		return nil, err
+	}
+
+	objByKey := make(map[kube.ResourceKey]*unstructured.Unstructured)
+	for i := range localObs {
+		obj := localObs[i]
+		if !hook.IsHook(obj) && !ignore.Ignore(obj) {
+			objByKey[kube.GetResourceKey(obj)] = obj
+		}
+	}
+	return objByKey, nil
+}
+
+// from https://github.com/argoproj/argo-cd/blob/d3ff9757c460ae1a6a11e1231251b5d27aadcdd1/cmd/argocd/commands/app.go#L879
+func groupObjsForDiff(resources []*argoappv1.ResourceDiff, objs map[kube.ResourceKey]*unstructured.Unstructured, items []objKeyLiveTarget, argoSettings *settings.Settings, appName string, namespace string) ([]objKeyLiveTarget, error) {
+	resourceTracking := argo.NewResourceTracking()
+	for _, res := range resources {
+		var live = &unstructured.Unstructured{}
+		if err := json.Unmarshal([]byte(res.NormalizedLiveState), &live); err != nil {
+			return nil, err
+		}
+
+		key := kube.ResourceKey{Name: res.Name, Namespace: res.Namespace, Group: res.Group, Kind: res.Kind}
+		if key.Kind == kube.SecretKind && key.Group == "" {
+			// Don't bother comparing secrets, argo-cd doesn't have access to k8s secret data
+			delete(objs, key)
+			continue
+		}
+		if local, ok := objs[key]; ok || live != nil {
+			if local != nil && !kube.IsCRD(local) {
+				if err := resourceTracking.SetAppInstance(
+					local, argoSettings.AppLabelKey, appName, namespace,
+					argoappv1.TrackingMethod(argoSettings.GetTrackingMethod()), argoSettings.GetInstallationID(),
+				); err != nil {
+					return nil, err
+				}
+			}
+
+			items = append(items, objKeyLiveTarget{key, live, local})
+			delete(objs, key)
+		}
+	}
+	for key, local := range objs {
+		if key.Kind == kube.SecretKind && key.Group == "" {
+			// Don't bother comparing secrets, argo-cd doesn't have access to k8s secret data
+			delete(objs, key)
+			continue
+		}
+		items = append(items, objKeyLiveTarget{key, nil, local})
+	}
+
+	return items, nil
+}
+
+// from https://github.com/argoproj/argo-cd/blob/d3ff9757c460ae1a6a11e1231251b5d27aadcdd1/cmd/argocd/commands/app.go#L879
+type resourceInfoProvider struct {
+	namespacedByGk map[schema.GroupKind]bool
+}
+
+// IsNamespaced infers if obj is namespaced or not from corresponding live objects list. If corresponding live object
+// has namespace then target object is also namespaced. If live object is missing then it does not matter if target is
+// namespaced or not.
+func (p *resourceInfoProvider) IsNamespaced(gk schema.GroupKind) (bool, error) {
+	return p.namespacedByGk[gk], nil
+}
+
+// PrintDiff prints a diff between two unstructured objects to stdout using an external diff utility
+// Honors the diff utility set in the KUBECTL_EXTERNAL_DIFF environment variable
+func PrintDiff(w io.Writer, live *unstructured.Unstructured, target *unstructured.Unstructured) error {
+	var err error
+	targetData := []byte("")
+	if target != nil {
+		targetData, err = yaml.Marshal(target)
+		if err != nil {
+			return err
+		}
+	}
+
+	liveData := []byte("")
+	if live != nil {
+		liveData, err = yaml.Marshal(live)
+		if err != nil {
+			return err
+		}
+	}
+
+	diffData := difflib.UnifiedDiff{
+		A: difflib.SplitLines(string(liveData)),
+		B: difflib.SplitLines(string(targetData)),
+		// FromFile: "Original",
+		// ToFile:   "Current",
+		Context: 2,
+	}
+
+	return difflib.WriteUnifiedDiff(w, diffData)
+	//return difflib.GetUnifiedDiffString(diff)
+	// return dmp.DiffPrettyText(diff), nil
+}

@@ -1,0 +1,115 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kubechecks.fullname" . }}
+  {{- with .Values.deployment.annotations }}
+  annotations: {{ toYaml . | nindent 4 }}
+  {{- end}}
+  labels: {{- include "kubechecks.labels" . | nindent 4 }}
+spec:
+  revisionHistoryLimit: {{ .Values.deployment.revisionHistoryLimit }}
+  replicas: {{ .Values.deployment.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "kubechecks.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+      {{- if .Values.configMap.create }}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+      {{- end }}
+      {{- if .Values.secrets.create }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secrets.yaml") . | sha256sum }}
+      {{- end }}
+      {{- with .Values.deployment.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- if .Values.commonLabels }}
+        {{- toYaml .Values.commonLabels | nindent 8 }}
+        {{- end }}
+        {{- include "kubechecks.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.deployment.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.serviceAccount.enabled}}
+      serviceAccountName: {{ include "kubechecks.serviceAccountName" . }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.deployment.podSecurityContext | nindent 8 }}
+      {{- with .Values.deployment.initContainers }}
+      initContainers:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          {{- with .Values.deployment.image }}
+          image: "{{ .name }}:{{ required "must set .deployment.image.tag" .tag }}"
+          imagePullPolicy: {{ .pullPolicy }}
+          {{- end }}
+          {{- with .Values.deployment.args }}
+          args: {{ . | toYaml | nindent 12 }}
+          {{- end }}
+          envFrom:
+            {{- if .Values.configMap.create }}
+            - configMapRef:
+                name: {{ include "kubechecks.name" . }}
+            {{- end }}
+            {{- if .Values.secrets.create }}
+            - secretRef:
+                name: {{ include "kubechecks.secretsName" . }}
+            {{- end }}
+          {{- with .Values.deployment.envFrom }}
+            {{- . | toYaml | nindent 12 }}
+          {{- end }}
+          {{- with .Values.deployment.env }}
+          env: {{ . | toYaml | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: {{ .Values.service.name }}
+              containerPort: 8080
+              protocol: TCP
+          {{- with .Values.deployment.securityContext}}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.deployment.resources | nindent 12 }}
+          startupProbe:
+            httpGet:
+              path: /live
+              port: 8080
+              scheme: HTTP
+            {{- toYaml .Values.deployment.startupProbe | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 8080
+              scheme: HTTP
+            {{- toYaml .Values.deployment.livenessProbe | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+              scheme: HTTP
+            {{- toYaml .Values.deployment.readinessProbe | nindent 12 }}
+          {{- with .Values.deployment.volumeMounts }}
+          volumeMounts: {{ . | toYaml | nindent 12 }}
+          {{- end }}
+      {{- with .Values.deployment.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.deployment.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.deployment.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.deployment.volumes }}
+      volumes: {{ . | toYaml | nindent 8 }}
+      {{- end }}

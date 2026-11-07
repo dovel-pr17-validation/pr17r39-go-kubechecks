@@ -1,0 +1,31 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: kubechecks
+
+images:
+  - name: quay.io/argoproj/argocd
+    newName: quay.io/argoproj/argocd
+    newTag: v3.2.1
+
+resources:
+  - argocd-initial-admin-secret.yaml
+  - ./manifests/crds
+  - ./manifests/cluster-rbac
+  - ./manifests/base/application-controller
+  - ./manifests/base/applicationset-controller
+  - ./manifests/base/dex
+  - ./manifests/base/repo-server
+  - ./manifests/base/server
+  - ./manifests/base/config
+  - ./manifests/base/redis
+
+patches:
+  - path: ./argocd-cm-patch.yaml
+  - path: ./argocd-rbac-cm-patch.yaml
+  - path: ./argocd-secret-patch.yaml
+  - path: ./argocd-server-patch.yaml
+  - path: ./argocd-application-controller-statefulset-patch.yaml
+  - path: ./argocd-applicationset-controller-deployment-patch.yaml
+  - path: ./argocd-redis-deployment-patch.yaml
+  - path: ./argocd-repo-server-deployment-patch.yaml

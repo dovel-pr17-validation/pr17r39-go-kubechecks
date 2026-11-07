@@ -1,0 +1,227 @@
+suite: basics
+
+templates:
+  - "*.yaml"
+
+values: [basics.min-values.yaml]
+
+tests:
+  - it: defaults to latest image tag
+    template: templates/deployment.yaml
+    asserts:
+      - equal:
+          path: metadata.labels["app.kubernetes.io/version"]
+          value: latest
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/zapier/kubechecks:latest
+
+  - it: should render
+    template: templates/deployment.yaml
+    set:
+      deployment:
+        image:
+          tag: v1.0.0
+    chart:
+      version: 0.1.0
+    release:
+      name: kubechecks
+    asserts:
+      - isKind:
+          of: Deployment
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/zapier/kubechecks:v1.0.0
+      - equal:
+          path: metadata.labels
+          value:
+            app.kubernetes.io/instance: kubechecks
+            app.kubernetes.io/managed-by: Helm
+            app.kubernetes.io/name: kubechecks
+            app.kubernetes.io/version: v1.0.0
+            helm.sh/chart: kubechecks-0.1.0
+
+  - it: should allow arbitrary annotations
+    template: templates/deployment.yaml
+    set:
+      deployment:
+        annotations:
+          fake-annotation.xyz/abc: "123"
+    # checksum/config below is a sha256 of the rendered ConfigMap, which carries
+    # helm.sh/chart and so moves with the chart's version. Pinned here, as the
+    # sibling test above pins it, so the fixture survives a version bump.
+    chart:
+      version: 0.1.0
+    asserts:
+      - equal:
+          path: metadata.annotations["fake-annotation.xyz/abc"]
+          value: "123"
+      - equal:
+          path: spec.template.metadata.annotations["checksum/config"]
+          value: "2fb7a6f708f879d5fe0ab560802da038a8205e67b3193eeb2a874fcf106628a5"
+  - it: should allow configuration of resources
+    template: templates/deployment.yaml
+    set:
+      deployment:
+        resources:
+          limits:
+            memory: 192Mi
+            cpu: 100m
+          requests:
+            memory: 128Mi
+            cpu: 50m
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources
+          value:
+            limits:
+              memory: 192Mi
+              cpu: 100m
+            requests:
+              memory: 128Mi
+              cpu: 50m
+  - it: should allow configuration of replicaCount
+    template: templates/deployment.yaml
+    set:
+      deployment:
+        replicaCount: 2
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 2
+  - it: should allow configuration of probes
+    template: templates/deployment.yaml
+    set:
+      deployment:
+        startupProbe:
+          failureThreshold: 300
+          periodSeconds: 5
+        livenessProbe:
+          failureThreshold: 200
+          periodSeconds: 50
+        readinessProbe:
+          failureThreshold: 100
+          periodSeconds: 10
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe
+          value:
+            failureThreshold: 300
+            httpGet:
+              path: /live
+              port: 8080
+              scheme: HTTP
+            periodSeconds: 5
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe
+          value:
+            failureThreshold: 200
+            httpGet:
+              path: /live
+              port: 8080
+              scheme: HTTP
+            initialDelaySeconds: 5
+            periodSeconds: 50
+            successThreshold: 1
+            timeoutSeconds: 5
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe
+          value:
+            failureThreshold: 100
+            httpGet:
+              path: /ready
+              port: 8080
+              scheme: HTTP
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 5
+
+  - it: should allow configuration of labels
+    template: templates/deployment.yaml
+    set:
+      commonLabels:
+        team: "test"
+    asserts:
+      - equal:
+          path: metadata.labels.team
+          value: "test"
+  - it: should allow configuration of args
+    template: templates/deployment.yaml
+    set:
+      deployment:
+        args:
+          - one
+          - two
+          - "123"
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].args
+          value: [one, two, "123"]
+  - it: can have volumes
+    template: templates/deployment.yaml
+    set:
+      deployment:
+        volumes:
+          - name: test-volume
+            hostPath:
+              path: /abc/def
+        volumeMounts:
+          - name: test-volume
+            path: /ghi
+    asserts:
+      - equal:
+          path: spec.template.spec.volumes
+          value:
+            - hostPath:
+                path: /abc/def
+              name: test-volume
+      - equal:
+          path: spec.template.spec.containers[0].volumeMounts
+          value:
+            - name: test-volume
+              path: /ghi
+  - it: can have new envFrom
+    template: templates/deployment.yaml
+    set:
+      deployment:
+        envFrom:
+          - configMapRef:
+              name: new-configmap
+          - secretMap:
+              name: new-secret
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].envFrom
+          value:
+            - configMapRef:
+                name: kubechecks
+            - configMapRef:
+                name: new-configmap
+            - secretMap:
+                name: new-secret
+  - it: should render tag as annotation
+    template: templates/deployment.yaml
+    chart:
+      appVersion: 1.0.0
+      version: 0.1.0
+    release:
+      name: kubechecks
+    set:
+      deployment:
+        image:
+          tag: 2.0.0
+    asserts:
+      - isKind:
+          of: Deployment
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/zapier/kubechecks:2.0.0
+      - equal:
+          path: metadata.labels
+          value:
+            app.kubernetes.io/instance: kubechecks
+            app.kubernetes.io/managed-by: Helm
+            app.kubernetes.io/name: kubechecks
+            app.kubernetes.io/version: 2.0.0
+            helm.sh/chart: kubechecks-0.1.0

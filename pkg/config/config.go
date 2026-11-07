@@ -1,0 +1,191 @@
+package config
+
+import (
+	"context"
+	"fmt"
+	"reflect"
+	"strings"
+	"time"
+
+	"github.com/pkg/errors"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
+	"github.com/spf13/viper"
+
+	"github.com/zapier/kubechecks/pkg"
+)
+
+// GitCredsFunc returns HTTP basic-auth credentials for git-over-HTTPS operations
+// (cloning policy and schema repositories). The returned password may be short-lived —
+// for example a GitHub App installation token that is refreshed on demand — so callers
+// must invoke this per operation and must not cache the result. An empty password means
+// anonymous access.
+type GitCredsFunc func(ctx context.Context) (username, password string, err error)
+
+// set default values in /cmd/root.go's init function
+
+type ServerConfig struct {
+	// argocd
+	ArgoCDServerAddr         string `mapstructure:"argocd-api-server-addr"`
+	ArgoCDToken              string `mapstructure:"argocd-api-token"`
+	ArgoCDPathPrefix         string `mapstructure:"argocd-api-path-prefix"`
+	ArgoCDInsecure           bool   `mapstructure:"argocd-api-insecure"`
+	ArgoCDNamespace          string `mapstructure:"argocd-api-namespace"`
+	ArgoCDPlainText          bool   `mapstructure:"argocd-api-plaintext"`
+	ArgoCDRepositoryEndpoint string `mapstructure:"argocd-repository-endpoint"`
+	ArgoCDRepositoryInsecure bool   `mapstructure:"argocd-repository-insecure"`
+	ArgoCDSendFullRepository bool   `mapstructure:"argocd-send-full-repository"`
+	ArgoCDIncludeDotGit      bool   `mapstructure:"argocd-include-dot-git"`
+	KubernetesConfig         string `mapstructure:"kubernetes-config"`
+	KubernetesType           string `mapstructure:"kubernetes-type"`
+	KubernetesClusterID      string `mapstructure:"kubernetes-clusterid"`
+
+	// otel
+	EnableOtel        bool   `mapstructure:"otel-enabled"`
+	OtelCollectorHost string `mapstructure:"otel-collector-host"`
+	OtelCollectorPort string `mapstructure:"otel-collector-port"`
+
+	// vcs
+	VcsUsername  string `mapstructure:"vcs-username"`
+	VcsEmail     string `mapstructure:"vcs-email"`
+	VcsBaseUrl   string `mapstructure:"vcs-base-url"`
+	VcsUploadUrl string `mapstructure:"vcs-upload-url"` // github enterprise upload URL
+	VcsToken     string `mapstructure:"vcs-token"`
+	VcsType      string `mapstructure:"vcs-type"`
+
+	//github
+	GithubPrivateKey     string `mapstructure:"github-private-key"`
+	GithubAppID          int64  `mapstructure:"github-app-id"`
+	GithubInstallationID int64  `mapstructure:"github-installation-id"`
+
+	// GitCreds supplies credentials for git-over-HTTPS operations (cloning policy and
+	// schema repositories). It is populated at startup from the VCS client rather than
+	// from configuration — a static token for PAT auth, or a refreshing installation
+	// token for GitHub App auth. When nil, git operations fall back to VcsToken.
+	GitCreds GitCredsFunc `mapstructure:"-" json:"-"`
+
+	// webhooks
+	// WebhookRepositories are the repositories that kubechecks ensures have a webhook
+	// pointing back at it. When empty, no webhooks are managed.
+	WebhookRepositories []string `mapstructure:"webhook-repositories"`
+	WebhookSecret       string   `mapstructure:"webhook-secret"`
+	WebhookUrlBase      string   `mapstructure:"webhook-url-base"`
+	UrlPrefix           string   `mapstructure:"webhook-url-prefix"`
+
+	// checks
+	// -- conftest
+	EnableConfTest     bool            `mapstructure:"enable-conftest"`
+	PoliciesLocation   []string        `mapstructure:"policies-location"`
+	WorstConfTestState pkg.CommitState `mapstructure:"worst-conftest-state"`
+	// -- hooks
+	EnableHooksRenderer bool            `mapstructure:"enable-hooks-renderer"`
+	WorstHooksState     pkg.CommitState `mapstructure:"worst-hooks-state"`
+	// -- kubeconform
+	EnableKubeConform     bool            `mapstructure:"enable-kubeconform"`
+	WorstKubeConformState pkg.CommitState `mapstructure:"worst-kubeconform-state"`
+	// -- preupgrade
+	EnablePreupgrade      bool            `mapstructure:"enable-preupgrade"`
+	WorstPreupgradeState  pkg.CommitState `mapstructure:"worst-preupgrade-state"`
+	KubepugGeneratedStore string          `mapstructure:"kubepug-generated-store"`
+
+	// ai
+	EnableAIDiffSummary       bool            `mapstructure:"enable-ai-diff-summary"`
+	EnableAIReview            bool            `mapstructure:"enable-ai-review"`
+	AIReviewPostSuggestions   bool            `mapstructure:"ai-review-post-suggestions"`
+	AIReviewProvider          string          `mapstructure:"ai-review-provider"`
+	AIReviewModel             string          `mapstructure:"ai-review-model"`
+	AIReviewMaxApps           int             `mapstructure:"ai-review-max-apps"`
+	AIReviewMaxTurns          int             `mapstructure:"ai-review-max-turns"`
+	AIReviewTimeout           time.Duration   `mapstructure:"ai-review-timeout"`
+	AIReviewSystemPrompt      string          `mapstructure:"ai-review-system-prompt"`
+	AIReviewExtraInstructions string          `mapstructure:"ai-review-extra-instructions"`
+	AnthropicAPIKey           string          `mapstructure:"anthropic-api-key"`
+	ChartCacheDir             string          `mapstructure:"chart-cache-dir"`
+	WorstAIReviewState        pkg.CommitState `mapstructure:"worst-ai-review-state"`
+
+	// misc
+	AdditionalAppsNamespaces []string      `mapstructure:"additional-apps-namespaces"`
+	AnnounceNoChanges        bool          `mapstructure:"announce-no-changes"`
+	FallbackK8sVersion       string        `mapstructure:"fallback-k8s-version"`
+	LabelFilter              string        `mapstructure:"label-filter"`
+	LogLevel                 zerolog.Level `mapstructure:"log-level"`
+	MonitorAllApplications   bool          `mapstructure:"monitor-all-applications"`
+	OpenAIAPIToken           string        `mapstructure:"openai-api-token"`
+	RepoRefreshInterval      time.Duration `mapstructure:"repo-refresh-interval"`
+	RepoCacheEnabled         bool          `mapstructure:"repo-cache-enabled"`
+	RepoCacheDir             string        `mapstructure:"repo-cache-dir"`
+	RepoCacheTTL             time.Duration `mapstructure:"repo-cache-ttl"`
+	ArchiveCacheDir          string        `mapstructure:"archive-cache-dir"`
+	ArchiveCacheTTL          time.Duration `mapstructure:"archive-cache-ttl"`
+	// SchemasLocations are searched, in order, for the schema of each resource. An
+	// absolute path, an http(s) location or a git url addresses something outside the
+	// pull request; a relative path names a directory inside the repository being
+	// checked, so schemas committed alongside the manifests that use them are found.
+	SchemasLocations         []string `mapstructure:"schemas-location"`
+	ShowDebugInfo            bool     `mapstructure:"show-debug-info"`
+	TidyOutdatedCommentsMode string   `mapstructure:"tidy-outdated-comments-mode"`
+	MaxQueueSize             int64    `mapstructure:"max-queue-size"`
+	MaxConcurrentChecks      int      `mapstructure:"max-concurrent-checks"`
+	MaxRepoWorkerQueueSize   int      `mapstructure:"max-repo-worker-queue-size"`
+	ReplanCommentMessage     string   `mapstructure:"replan-comment-msg"`
+	Identifier               string   `mapstructure:"identifier"`
+	MaxCommentsPerCheck      int      `mapstructure:"max-comments-per-check"`
+}
+
+func (cfg ServerConfig) IsGithubApp() bool {
+	return cfg.GithubAppID != 0 && cfg.GithubInstallationID != 0 && cfg.GithubPrivateKey != ""
+}
+
+func New() (ServerConfig, error) {
+	return NewWithViper(viper.GetViper())
+}
+
+func NewWithViper(v *viper.Viper) (ServerConfig, error) {
+	var cfg ServerConfig
+	if err := v.Unmarshal(&cfg, viper.DecodeHook(func(in reflect.Type, out reflect.Type, value interface{}) (interface{}, error) {
+		if in.String() == "string" && out.String() == "zerolog.Level" {
+			input := value.(string)
+			return zerolog.ParseLevel(input)
+		}
+
+		if in.String() == "string" && out.String() == "pkg.CommitState" {
+			input := value.(string)
+			return pkg.ParseCommitState(input)
+		}
+
+		if in.String() == "string" && out.String() == "time.Duration" {
+			input := value.(string)
+			return time.ParseDuration(input)
+		}
+
+		if in.String() == "string" && out.String() == "[]string" {
+			input := value.(string)
+			ns := strings.Split(input, ",")
+			return ns, nil
+		}
+
+		return value, nil
+	})); err != nil {
+		return cfg, errors.Wrap(err, "failed to read configuration")
+	}
+
+	if cfg.VcsBaseUrl == "" {
+		cfg.VcsBaseUrl = fmt.Sprintf("https://%s.com", cfg.VcsType)
+	}
+
+	// not set at all, which is the case when there are no flag defaults behind viper
+	if cfg.MaxCommentsPerCheck == 0 {
+		cfg.MaxCommentsPerCheck = pkg.MaxCommentsPerCheck
+	}
+	if cfg.MaxCommentsPerCheck < 1 || cfg.MaxCommentsPerCheck > pkg.MaxCommentsPerCheck {
+		return cfg, fmt.Errorf("max-comments-per-check must be between 1 and %d, got %d", pkg.MaxCommentsPerCheck, cfg.MaxCommentsPerCheck)
+	}
+
+	log.Info().Msg("Server Configuration: ")
+	log.Info().Msgf("Webhook URL Base: %s", cfg.WebhookUrlBase)
+	log.Info().Msgf("Webhook URL Prefix: %s", cfg.UrlPrefix)
+	log.Info().Msgf("VCS Type: %s", cfg.VcsType)
+	log.Info().Msgf("ArgoCD Namespace: %s", cfg.ArgoCDNamespace)
+
+	return cfg, nil
+}

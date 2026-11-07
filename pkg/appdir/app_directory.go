@@ -1,0 +1,291 @@
+package appdir
+
+import (
+	"path"
+	"path/filepath"
+	"strings"
+
+	"github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
+	"github.com/rs/zerolog/log"
+)
+
+// AppDirectory manages the mapping between applications and their associated directories and files.
+// It provides functionality to track which applications are affected by changes in specific directories or files,
+// and maintains a collection of Argo CD applications.
+type AppDirectory struct {
+	// appDirs maps directory paths to the names of applications that use those directories.
+	// This is used to quickly identify which applications are affected when changes occur in a directory.
+	appDirs map[string][]string
+
+	// appFiles maps file paths to the names of applications that use those files.
+	// This is used to quickly identify which applications are affected when specific files change.
+	appFiles map[string][]string
+
+	// appsMap stores the full Argo CD application definitions, indexed by application name.
+	// This serves as the source of truth for application configurations.
+	appsMap map[string]v1alpha1.Application
+}
+
+func NewAppDirectory() *AppDirectory {
+	return &AppDirectory{
+		appDirs:  make(map[string][]string),
+		appFiles: make(map[string][]string),
+		appsMap:  make(map[string]v1alpha1.Application),
+	}
+}
+
+func (d *AppDirectory) AppsCount() int {
+	return len(d.appsMap)
+}
+
+func (d *AppDirectory) AppFilesCount() int {
+	return len(d.appFiles)
+}
+
+func (d *AppDirectory) AppDirsCount() int {
+	return len(d.appDirs)
+}
+
+func (d *AppDirectory) Union(other *AppDirectory) *AppDirectory {
+	var join AppDirectory
+	join.appsMap = mergeMaps(d.appsMap, other.appsMap, takeFirst[v1alpha1.Application])
+	join.appDirs = mergeMaps(d.appDirs, other.appDirs, mergeLists[string])
+	join.appFiles = mergeMaps(d.appFiles, other.appFiles, mergeLists[string])
+	return &join
+}
+
+// FindAppsBasedOnChangeList receives a list of modified file paths and
+// returns the list of applications that are affected by the changes.
+//
+// changeList: a slice of strings representing the paths of modified files.
+// targetBranch: the branch name to compare against the target revision of the applications.
+// e.g. changeList = ["path/to/file1", "path/to/file2"]
+func (d *AppDirectory) FindAppsBasedOnChangeList(changeList []string, targetBranch string) []v1alpha1.Application {
+	log.Debug().Caller().Msgf("checking %d changes", len(changeList))
+
+	appsSet := make(map[string]struct{})
+	for _, changePath := range changeList {
+		log.Debug().Caller().Msgf("change: %s", changePath)
+		for dir, appNames := range d.appDirs {
+			if dirContainsPath(dir, changePath) {
+				log.Debug().Caller().
+					Str("changePath", changePath).
+					Str("dir", dir).
+					Msg("dir match!")
+				for _, appName := range appNames {
+					appsSet[appName] = struct{}{}
+				}
+			}
+		}
+
+		appNames, ok := d.appFiles[changePath]
+		if ok {
+			log.Debug().Caller().Str("changePath", changePath).Msg("file match!")
+			for _, appName := range appNames {
+				appsSet[appName] = struct{}{}
+			}
+		}
+	}
+
+	var appsSlice []v1alpha1.Application
+	for appName := range appsSet {
+		app, ok := d.appsMap[appName]
+		if !ok {
+			log.Warn().Msgf("failed to find matched app named '%s'", appName)
+			continue
+		}
+
+		if !shouldInclude(app, targetBranch) {
+			log.Debug().Caller().
+				Msgf("target revision of %s is %s and does not match '%s'", appName, getTargetRevision(app), targetBranch)
+			continue
+		}
+
+		appsSlice = append(appsSlice, app)
+	}
+
+	log.Debug().Caller().Msgf("matched %d files into %d apps", len(changeList), len(appsSet))
+	return appsSlice
+}
+
+// dirContainsPath reports whether changePath (a repo-relative file path, e.g.
+// "charts/foo/values.yaml") falls within dir (an ArgoCD application source
+// path, e.g. "charts/foo", "/charts/foo", ".", "/", or "").
+//
+// ArgoCD treats an empty path, ".", and "/" as all meaning "the repository
+// root", so an app configured with any of those source paths is affected by
+// every change in the repo. Beyond that, matching is done on path segment
+// boundaries (rather than a raw string prefix) so that, for example, dir
+// "apps" does not incorrectly match changePath "apps-other/foo.yaml".
+func dirContainsPath(dir, changePath string) bool {
+	changePath = path.Clean(changePath)
+
+	dir = path.Clean(dir)
+	if dir == "." || dir == "/" {
+		// path.Clean("") == "."
+		return true
+	}
+	dir = strings.TrimPrefix(dir, "/")
+
+	if changePath == dir {
+		return true
+	}
+
+	return strings.HasPrefix(changePath, dir+"/")
+}
+
+func getTargetRevision(app v1alpha1.Application) string {
+	return app.Spec.GetSource().TargetRevision
+}
+
+func getSourcePath(app v1alpha1.Application) string {
+	return app.Spec.GetSource().Path
+}
+
+func shouldInclude(app v1alpha1.Application, targetBranch string) bool {
+	targetRevision := getTargetRevision(app)
+	if targetRevision == "" {
+		return true
+	}
+
+	if targetRevision == targetBranch {
+		return true
+	}
+
+	if targetRevision == "HEAD" {
+		if targetBranch == "main" {
+			return true
+		}
+
+		if targetBranch == "master" {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (d *AppDirectory) GetApps(filter func(stub v1alpha1.Application) bool) []v1alpha1.Application {
+	var result []v1alpha1.Application
+	for _, value := range d.appsMap {
+		if filter != nil && !filter(value) {
+			continue
+		}
+		result = append(result, value)
+	}
+	return result
+}
+
+func (d *AppDirectory) AddApp(app v1alpha1.Application) {
+	if _, exists := d.appsMap[app.Name]; exists {
+		log.Debug().Caller().Msgf("app %s already exists", app.Name)
+		return
+	}
+
+	for _, src := range getSources(app) {
+		sourcePath := src.Path
+		log.Debug().
+			Caller().
+			Str("appName", app.Name).
+			Str("cluster-name", app.Spec.Destination.Name).
+			Str("cluster-server", app.Spec.Destination.Server).
+			Str("source", sourcePath).
+			Msg("add app")
+
+		d.appsMap[app.Name] = app
+		d.addDir(app.Name, sourcePath)
+
+		// handle extra helm paths
+		if helm := src.Helm; helm != nil {
+			for _, param := range helm.FileParameters {
+				path := filepath.Join(sourcePath, param.Path)
+				d.addFile(app.Name, path)
+			}
+
+			for _, valueFilePath := range helm.ValueFiles {
+				path := filepath.Join(sourcePath, valueFilePath)
+				d.addFile(app.Name, path)
+			}
+		}
+	}
+}
+
+func getSources(app v1alpha1.Application) []v1alpha1.ApplicationSource {
+	if !app.Spec.HasMultipleSources() {
+		return []v1alpha1.ApplicationSource{*app.Spec.Source}
+	}
+
+	return app.Spec.Sources
+}
+
+func (d *AppDirectory) addDir(appName, path string) {
+	d.appDirs[path] = append(d.appDirs[path], appName)
+}
+
+func (d *AppDirectory) addFile(appName, path string) {
+	d.appFiles[path] = append(d.appFiles[path], appName)
+}
+
+func (d *AppDirectory) RemoveApp(app v1alpha1.Application) {
+	log.Debug().
+		Caller().
+		Str("appName", app.Name).
+		Str("cluster-name", app.Spec.Destination.Name).
+		Str("cluster-server", app.Spec.Destination.Server).
+		Msg("delete app")
+
+	// remove app from appsMap
+	delete(d.appsMap, app.Name)
+
+	// Clean up app from appDirs
+	sourcePath := getSourcePath(app)
+	d.appDirs[sourcePath] = removeFromSlice[string](d.appDirs[sourcePath], app.Name, func(a, b string) bool { return a == b })
+
+	// Clean up app from appFiles
+	src := app.Spec.GetSource()
+	srcPath := src.Path
+	if helm := src.Helm; helm != nil {
+		for _, param := range helm.FileParameters {
+			path := filepath.Join(srcPath, param.Path)
+			d.appFiles[path] = removeFromSlice[string](d.appFiles[path], app.Name, func(a, b string) bool { return a == b })
+		}
+
+		for _, valueFilePath := range helm.ValueFiles {
+			path := filepath.Join(srcPath, valueFilePath)
+			d.appFiles[path] = removeFromSlice[string](d.appFiles[path], app.Name, func(a, b string) bool { return a == b })
+		}
+	}
+}
+
+func mergeMaps[T any](first map[string]T, second map[string]T, combine func(T, T) T) map[string]T {
+	result := make(map[string]T)
+	for key, value := range first {
+		result[key] = value
+	}
+	for key, value := range second {
+		exist, ok := result[key]
+		if ok {
+			result[key] = combine(exist, value)
+		} else {
+			result[key] = value
+		}
+	}
+	return result
+}
+
+func mergeLists[T any](a []T, b []T) []T {
+	return append(a, b...)
+}
+
+func takeFirst[T any](a, _ T) T {
+	return a
+}
+
+func removeFromSlice[T any](slice []T, element T, equal func(T, T) bool) []T {
+	for i, j := range slice {
+		if equal(j, element) {
+			return append(slice[:i], slice[i+1:]...)
+		}
+	}
+	return slice
+}

@@ -1,0 +1,22 @@
+
+# /////////////////////////////////////////////////////////////////////////////
+# Test ArgoCD Applications
+# /////////////////////////////////////////////////////////////////////////////
+
+def copy_test_appsets(cfg):
+    # Load the terraform url we output, default to gitlab if cant find a vcs-type variable
+    vcsPath = "./localdev/terraform/{}/project.url".format(cfg.get('vcs-type', 'gitlab'))
+    print("Path to url: " + vcsPath)
+    projectUrl=str(read_file(vcsPath, "")).strip('\n')
+    print("Remote Project URL: " + projectUrl)
+
+    if projectUrl != "":
+      for appset in ["httpdump","echo-server"]:
+        source_file = "./localdev/test_appsets/{}.yaml".format(appset)
+        dest_file = "./localdev/terraform/modules/vcs_files/base_files/appsets/{}/{}.yaml".format(appset,appset)
+
+        # Copy the file to the specific terraform directory
+        local("mkdir -p ./localdev/terraform/modules/vcs_files/base_files/appsets/{} && cp {} {}".format(appset, source_file, dest_file))
+
+        # Modify the copied file to replace ${REPO_URL} with projectUrl
+        local("sed -i '' 's#REPO_URL#{}#g' {}".format(projectUrl, dest_file))

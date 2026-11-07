@@ -1,0 +1,51 @@
+package config
+
+import (
+	"testing"
+	"time"
+
+	"github.com/rs/zerolog"
+	"github.com/spf13/viper"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/zapier/kubechecks/pkg"
+)
+
+func TestNew(t *testing.T) {
+	v := viper.New()
+	v.Set("log-level", "info")
+	v.Set("argocd-api-insecure", "true")
+	v.Set("argocd-api-plaintext", "true")
+	v.Set("worst-conftest-state", "warning")
+	v.Set("repo-refresh-interval", "10m")
+	v.Set("additional-apps-namespaces", "default,kube-system")
+
+	cfg, err := NewWithViper(v)
+	require.NoError(t, err)
+	assert.Equal(t, zerolog.InfoLevel, cfg.LogLevel)
+	assert.Equal(t, true, cfg.ArgoCDInsecure)
+	assert.Equal(t, true, cfg.ArgoCDPlainText)
+	assert.Equal(t, pkg.StateWarning, cfg.WorstConfTestState, "worst states can be overridden")
+	assert.Equal(t, time.Minute*10, cfg.RepoRefreshInterval)
+	assert.Equal(t, []string{"default", "kube-system"}, cfg.AdditionalAppsNamespaces)
+}
+
+func TestNew_MaxCommentsPerCheck(t *testing.T) {
+	for value, want := range map[int]int{0: 999, 1: 1, 25: 25, 999: 999} {
+		v := viper.New()
+		v.Set("max-comments-per-check", value)
+
+		cfg, err := NewWithViper(v)
+		require.NoError(t, err, "%d", value)
+		assert.Equal(t, want, cfg.MaxCommentsPerCheck, "%d", value)
+	}
+
+	for _, value := range []int{-1, 1000} {
+		v := viper.New()
+		v.Set("max-comments-per-check", value)
+
+		_, err := NewWithViper(v)
+		require.ErrorContains(t, err, "max-comments-per-check", "%d", value)
+	}
+}

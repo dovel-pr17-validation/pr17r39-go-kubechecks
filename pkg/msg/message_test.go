@@ -1,0 +1,370 @@
+package msg
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/zapier/kubechecks/pkg"
+)
+
+type fakeEmojiable struct {
+	emoji string
+}
+
+func (fe fakeEmojiable) ToEmoji(state pkg.CommitState) string { return fe.emoji }
+
+var testCommentOptions = CommentOptions{
+	Start:        time.Now(),
+	CommitSHA:    "commit-sha",
+	LabelFilter:  "label-filter",
+	Identifier:   "test-identifier",
+	AppsChecked:  1,
+	TotalChecked: 2,
+	MaxLength:    64 * 1024,
+	MaxComments:  pkg.MaxCommentsPerCheck,
+}
+
+func TestBuildComment(t *testing.T) {
+	appResults := map[string]*AppResults{
+		"myapp": {
+			results: []Result{
+				{
+					State:   pkg.StateError,
+					Summary: "this failed bigly",
+					Details: "should add some important details here",
+				},
+			},
+		},
+	}
+	m := NewMessage("message", 1, 2, fakeEmojiable{":test:"})
+	m.apps = appResults
+	chunks := m.BuildComment(context.TODO(), testCommentOptions)
+	require.Len(t, chunks, 1)
+	assert.Equal(t, `# Kubechecks test-identifier Report
+<details>
+<summary>
+
+## ArgoCD Application Checks: `+"`myapp`"+` :test:
+</summary>
+
+<details>
+<summary>this failed bigly Error :test:</summary>
+
+should add some important details here
+</details></details>
+
+<small> _Done. CommitSHA: commit-sha_ <small>
+`, chunks[0])
+}
+
+func TestBuildComment_SkipUnchanged(t *testing.T) {
+	appResults := map[string]*AppResults{
+		"myapp": {
+			results: []Result{
+				{
+					State:   pkg.StateError,
+					Summary: "this failed bigly",
+					Details: "should add some important details here",
+				},
+			},
+		},
+		"myapp2": {
+			results: []Result{
+				{
+					State:   pkg.StateError,
+					Summary: "this thing failed",
+					Details: "should add some important details here",
+				},
+				{
+					State:             pkg.StateError,
+					Summary:           "this also failed",
+					Details:           "there are no important details",
+					NoChangesDetected: true, // this should remove the app entirely
+				},
+			},
+		},
+	}
+
+	m := NewMessage("message", 1, 2, fakeEmojiable{":test:"})
+	m.apps = appResults
+	chunks := m.BuildComment(context.TODO(), testCommentOptions)
+	require.Len(t, chunks, 1)
+	assert.Equal(t, `# Kubechecks test-identifier Report
+<details>
+<summary>
+
+## ArgoCD Application Checks: `+"`myapp`"+` :test:
+</summary>
+
+<details>
+<summary>this failed bigly Error :test:</summary>
+
+should add some important details here
+</details></details>
+
+<small> _Done. CommitSHA: commit-sha_ <small>
+`, chunks[0])
+}
+
+// every check reporting no changes still has to say so, the one-comment path frames an empty chunk
+func TestBuildComment_NothingToReport(t *testing.T) {
+	m := NewMessage("message", 1, 2, fakeEmojiable{":test:"})
+	m.apps = map[string]*AppResults{
+		"app-a": {results: []Result{{NoChangesDetected: true}}},
+		"app-b": {results: []Result{{State: pkg.StateSkip, Summary: "skipped"}, {NoChangesDetected: true}}},
+	}
+
+	chunks := m.BuildComment(context.TODO(), testCommentOptions)
+
+	require.Len(t, chunks, 1)
+	assert.Equal(t, "# Kubechecks test-identifier Report\nNo changes\n\n<small> _Done. CommitSHA: commit-sha_ <small>\n", chunks[0])
+}
+
+// a report that fits in one comment renders exactly as it does without splitting
+func TestBuildComment_SeveralApps(t *testing.T) {
+	m := NewMessage("message", 1, 2, fakeEmojiable{":test:"})
+	m.apps = map[string]*AppResults{
+		"app-a": {results: []Result{{State: pkg.StateError, Summary: "this failed bigly", Details: "details"}}},
+		"app-b": {results: []Result{{State: pkg.StateSkip, Summary: "skipped", Details: "nothing"}}},
+		"app-c": {results: []Result{{State: pkg.StateSuccess, Summary: "fine", Details: "details"}, {NoChangesDetected: true}}},
+	}
+
+	chunks := m.BuildComment(context.TODO(), testCommentOptions)
+
+	require.Len(t, chunks, 1)
+	assert.Equal(t, `# Kubechecks test-identifier Report
+<details>
+<summary>
+
+## ArgoCD Application Checks: `+"`app-a`"+` :test:
+</summary>
+
+<details>
+<summary>this failed bigly Error :test:</summary>
+
+details
+</details></details><details>
+<summary>
+
+## ArgoCD Application Checks: `+"`app-b`"+` :test:
+</summary>
+
+</details>
+
+<small> _Done. CommitSHA: commit-sha_ <small>
+`, chunks[0])
+}
+
+func TestMessageIsSuccess(t *testing.T) {
+	t.Run("logic works", func(t *testing.T) {
+		var (
+			message = NewMessage("name", 1, 2, fakeEmojiable{":test:"})
+			ctx     = context.TODO()
+		)
+
+		// no apps mean success
+		assert.Equal(t, pkg.StateNone, message.WorstState())
+
+		// one app, no checks = success
+		message.AddNewApp(ctx, "some-app")
+		assert.Equal(t, pkg.StateNone, message.WorstState())
+
+		// one app, one success = success
+		message.AddToAppMessage(ctx, "some-app", Result{State: pkg.StateSuccess})
+		assert.Equal(t, pkg.StateSuccess, message.WorstState())
+
+		// one app, one success, one failure = failure
+		message.AddToAppMessage(ctx, "some-app", Result{State: pkg.StateFailure})
+		assert.Equal(t, pkg.StateFailure, message.WorstState())
+
+		// one app, two successes, one failure = failure
+		message.AddToAppMessage(ctx, "some-app", Result{State: pkg.StateSuccess})
+		assert.Equal(t, pkg.StateFailure, message.WorstState())
+
+		// one app, two successes, one failure = failure
+		message.AddToAppMessage(ctx, "some-app", Result{State: pkg.StateSuccess})
+		assert.Equal(t, pkg.StateFailure, message.WorstState())
+
+		// two apps: second app's success does not override first app's failure
+		message.AddNewApp(ctx, "some-other-app")
+		message.AddToAppMessage(ctx, "some-other-app", Result{State: pkg.StateSuccess})
+		assert.Equal(t, pkg.StateFailure, message.WorstState())
+	})
+
+	testcases := map[pkg.CommitState]struct{}{
+		pkg.StateNone:    {},
+		pkg.StateSuccess: {},
+		pkg.StateRunning: {},
+		pkg.StateWarning: {},
+		pkg.StateFailure: {},
+		pkg.StateError:   {},
+		pkg.StatePanic:   {},
+	}
+
+	for state := range testcases {
+		t.Run(state.BareString(), func(t *testing.T) {
+			var (
+				message = NewMessage("name", 1, 2, fakeEmojiable{":test:"})
+				ctx     = context.TODO()
+			)
+			message.AddNewApp(ctx, "some-app")
+			message.AddToAppMessage(ctx, "some-app", Result{State: state})
+			assert.Equal(t, state, message.WorstState())
+		})
+	}
+}
+
+func TestWorstStateSkipsNoChangesDetected(t *testing.T) {
+	t.Run("error with NoChangesDetected should not affect WorstState", func(t *testing.T) {
+		var (
+			message = NewMessage("name", 1, 2, fakeEmojiable{":test:"})
+			ctx     = context.TODO()
+		)
+
+		message.AddNewApp(ctx, "some-app")
+		// Add a success result
+		message.AddToAppMessage(ctx, "some-app", Result{State: pkg.StateSuccess})
+		assert.Equal(t, pkg.StateSuccess, message.WorstState())
+
+		// Add an error with NoChangesDetected - should be ignored by WorstState
+		message.AddToAppMessage(ctx, "some-app", Result{
+			State:             pkg.StateError,
+			Summary:           "error but no changes",
+			NoChangesDetected: true,
+		})
+		// WorstState should still be Success since the error has NoChangesDetected
+		assert.Equal(t, pkg.StateSuccess, message.WorstState())
+	})
+
+	t.Run("only NoChangesDetected results should return StateNone", func(t *testing.T) {
+		var (
+			message = NewMessage("name", 1, 2, fakeEmojiable{":test:"})
+			ctx     = context.TODO()
+		)
+
+		message.AddNewApp(ctx, "some-app")
+		// Add only results with NoChangesDetected
+		message.AddToAppMessage(ctx, "some-app", Result{
+			State:             pkg.StateSuccess,
+			NoChangesDetected: true,
+		})
+		message.AddToAppMessage(ctx, "some-app", Result{
+			State:             pkg.StateError,
+			NoChangesDetected: true,
+		})
+		// All results have NoChangesDetected, so WorstState should be StateNone
+		assert.Equal(t, pkg.StateNone, message.WorstState())
+	})
+}
+
+// HasChanges has to agree with what BuildComment renders: an empty report and
+// only an empty report is the one that has nothing to announce
+func TestHasChanges(t *testing.T) {
+	noChangesReport := "# Kubechecks test-identifier Report\nNo changes"
+
+	tests := map[string]map[string]*AppResults{
+		"no apps at all": {},
+		"every app came back with no changes": {
+			"app-a": {results: []Result{{NoChangesDetected: true}}},
+			"app-b": {results: []Result{{State: pkg.StateSkip, Summary: "skipped"}, {NoChangesDetected: true}}},
+		},
+		"one app with changes": {
+			"app-a": {results: []Result{{NoChangesDetected: true}}},
+			"app-b": {results: []Result{{State: pkg.StateSuccess, Summary: "1 added, 0 modified, 0 removed"}}},
+		},
+		"an app with no results yet": {
+			"app-a": {},
+		},
+	}
+
+	for name, apps := range tests {
+		t.Run(name, func(t *testing.T) {
+			m := NewMessage("message", 1, 2, fakeEmojiable{":test:"})
+			m.apps = apps
+
+			chunks := m.BuildComment(context.TODO(), testCommentOptions)
+
+			require.Len(t, chunks, 1)
+			assert.Equal(t, !strings.HasPrefix(chunks[0], noChangesReport), m.HasChanges())
+		})
+	}
+}
+
+func TestHasChangesSkipsDeletedApps(t *testing.T) {
+	var (
+		m   = NewMessage("message", 1, 2, fakeEmojiable{":test:"})
+		ctx = context.TODO()
+	)
+
+	m.AddNewApp(ctx, "some-app")
+	m.AddToAppMessage(ctx, "some-app", Result{State: pkg.StateSuccess, Summary: "1 added, 0 modified, 0 removed"})
+	assert.True(t, m.HasChanges())
+
+	m.RemoveApp("some-app")
+	assert.False(t, m.HasChanges())
+}
+
+func TestMultipleItemsWithNewlines(t *testing.T) {
+	var (
+		message = NewMessage("name", 1, 2, fakeEmojiable{":test:"})
+		ctx     = context.Background()
+	)
+	message.AddNewApp(ctx, "first-app")
+	message.AddToAppMessage(ctx, "first-app", Result{
+		State:   pkg.StateSuccess,
+		Summary: "summary-1",
+		Details: "detail-1",
+	})
+	message.AddToAppMessage(ctx, "first-app", Result{
+		State:   pkg.StateSuccess,
+		Summary: "summary-2",
+		Details: "detail-2",
+	})
+	message.AddNewApp(ctx, "second-app")
+	message.AddToAppMessage(ctx, "second-app", Result{
+		State:   pkg.StateSuccess,
+		Summary: "summary-1",
+		Details: "detail-1",
+	})
+	message.AddToAppMessage(ctx, "second-app", Result{
+		State:   pkg.StateSuccess,
+		Summary: "summary-2",
+		Details: "detail-2",
+	})
+	chunks := message.BuildComment(context.TODO(), testCommentOptions)
+	require.NotEmpty(t, chunks)
+	result := chunks[0]
+
+	// header rows need double newlines before and after
+	index := 0
+	newline := uint8('\n')
+	for {
+		index++
+		foundAt := strings.Index(result[index:], "---")
+		if foundAt == -1 {
+			break // couldn't be found, we're done
+		}
+		index += foundAt
+
+		if index < 2 {
+			continue // hyphens are at the beginning of the string, we're fine
+		}
+
+		if result[index-1] == '-' || result[index+3] == '-' {
+			continue // not a triple-hyphen, but a more-than-triple-hyphen, move on
+		}
+
+		// must be preceded by two newlines
+		assert.Equal(t, newline, result[index-1])
+		assert.Equal(t, newline, result[index-2])
+
+		// must be followed by two newlines
+		assert.Equal(t, newline, result[index+3])
+		assert.Equal(t, newline, result[index+4])
+	}
+}

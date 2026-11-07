@@ -1,0 +1,527 @@
+package events
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	gogit "github.com/go-git/go-git/v5"
+	gogitconfig "github.com/go-git/go-git/v5/config"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
+
+	"github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
+	"github.com/rs/zerolog"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+	affectedappsmocks "github.com/zapier/kubechecks/mocks/affected_apps/mocks"
+	generatorsmocks "github.com/zapier/kubechecks/mocks/generator/mocks"
+	vcsmocks "github.com/zapier/kubechecks/mocks/vcs/mocks"
+	"github.com/zapier/kubechecks/pkg"
+	"github.com/zapier/kubechecks/pkg/affected_apps"
+	"github.com/zapier/kubechecks/pkg/checks"
+	"github.com/zapier/kubechecks/pkg/config"
+	"github.com/zapier/kubechecks/pkg/container"
+	"github.com/zapier/kubechecks/pkg/generator"
+	"github.com/zapier/kubechecks/pkg/git"
+	"github.com/zapier/kubechecks/pkg/msg"
+	"github.com/zapier/kubechecks/pkg/vcs"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// mockRepoManager is a mock implementation of repoManager interface for testing
+type mockRepoManager struct {
+	mock.Mock
+}
+
+func (m *mockRepoManager) Clone(ctx context.Context, cloneURL, branchName string) (*git.Repo, error) {
+	args := m.Called(ctx, cloneURL, branchName)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*git.Repo), args.Error(1)
+}
+
+// createTestGitRepo creates a minimal git repository for testing using go-git (no git binary)
+func createTestGitRepo(t *testing.T, branchName string) string {
+	tempDir, err := os.MkdirTemp("", "kubechecks-test-")
+	require.NoError(t, err)
+
+	// Initialize git repo using go-git
+	repo, err := gogit.PlainInit(tempDir, false)
+	require.NoError(t, err)
+
+	// Create initial commit
+	worktree, err := repo.Worktree()
+	require.NoError(t, err)
+
+	testFile := filepath.Join(tempDir, "test.txt")
+	require.NoError(t, os.WriteFile(testFile, []byte("test"), 0644))
+
+	_, err = worktree.Add("test.txt")
+	require.NoError(t, err)
+
+	commitHash, err := worktree.Commit("initial commit", &gogit.CommitOptions{
+		Author: &object.Signature{
+			Name:  "Test User",
+			Email: "test@test.com",
+		},
+	})
+	require.NoError(t, err)
+
+	// Rename branch to match requested branch
+	if branchName == "" {
+		branchName = "main"
+	}
+	if branchName != "master" {
+		// Create the new branch
+		headRef, err := repo.Head()
+		require.NoError(t, err)
+
+		branchRef := plumbing.NewBranchReferenceName(branchName)
+		ref := plumbing.NewHashReference(branchRef, headRef.Hash())
+		err = repo.Storer.SetReference(ref)
+		require.NoError(t, err)
+
+		// Checkout the new branch
+		err = worktree.Checkout(&gogit.CheckoutOptions{
+			Branch: branchRef,
+		})
+		require.NoError(t, err)
+	}
+
+	// Set up origin remote (fake)
+	_, err = repo.CreateRemote(&gogitconfig.RemoteConfig{
+		Name: "origin",
+		URLs: []string{"https://github.com/test/test.git"},
+	})
+	require.NoError(t, err)
+
+	// Create remote tracking branch for the requested branch
+	originBranchRef := plumbing.NewRemoteReferenceName("origin", branchName)
+	ref := plumbing.NewHashReference(originBranchRef, commitHash)
+	err = repo.Storer.SetReference(ref)
+	require.NoError(t, err)
+
+	// Always set up refs/remotes/origin/main pointing to the same commit
+	originMainRef := plumbing.NewRemoteReferenceName("origin", "main")
+	ref = plumbing.NewHashReference(originMainRef, commitHash)
+	err = repo.Storer.SetReference(ref)
+	require.NoError(t, err)
+
+	// Set up refs/remotes/origin/HEAD to point to "main" (default branch)
+	originHeadRef := plumbing.NewSymbolicReference(
+		plumbing.NewRemoteReferenceName("origin", "HEAD"),
+		originMainRef,
+	)
+	err = repo.Storer.SetReference(originHeadRef)
+	require.NoError(t, err)
+
+	return tempDir
+}
+
+func TestCheckEventGetRepo(t *testing.T) {
+	cloneURL := "https://github.com/zapier/kubechecks.git"
+	canonical, err := canonicalize(cloneURL)
+	cfg := config.ServerConfig{}
+	require.NoError(t, err)
+
+	ctx := context.TODO()
+
+	t.Run("empty branch name", func(t *testing.T) {
+		vcsClient := new(vcsmocks.MockClient)
+		vcsClient.EXPECT().Username().Return("username")
+		vcsClient.EXPECT().CloneUsername().Return("clone-username")
+
+		// Create mock repo manager
+		mockRM := new(mockRepoManager)
+
+		// Create a real git repo for testing
+		tempDir := createTestGitRepo(t, "main")
+		defer os.RemoveAll(tempDir)
+
+		// Mock expects Clone to be called with HEAD, returns a repo with BranchName="main"
+		mockRM.On("Clone", ctx, mock.Anything, "HEAD").Return(&git.Repo{
+			Directory:  tempDir,
+			BranchName: "main",
+			CloneURL:   cloneURL,
+			Config:     cfg,
+		}, nil)
+
+		ce := CheckEvent{
+			clonedRepos: make(map[repoKey]*git.Repo),
+			repoManager: mockRM,
+			ctr:         container.Container{VcsClient: vcsClient},
+		}
+
+		repo, err := ce.getRepo(ctx, cloneURL, "")
+		require.NoError(t, err)
+		assert.Equal(t, "main", repo.BranchName)
+		assert.Len(t, ce.clonedRepos, 2)
+		assert.Contains(t, ce.clonedRepos, generateRepoKey(canonical, "HEAD"))
+		assert.Contains(t, ce.clonedRepos, generateRepoKey(canonical, "main"))
+		mockRM.AssertExpectations(t)
+	})
+
+	t.Run("branch is HEAD", func(t *testing.T) {
+		vcsClient := new(vcsmocks.MockClient)
+		vcsClient.EXPECT().Username().Return("username")
+		vcsClient.EXPECT().CloneUsername().Return("clone-username")
+
+		// Create mock repo manager
+		mockRM := new(mockRepoManager)
+
+		// Create a real git repo for testing
+		tempDir := createTestGitRepo(t, "main")
+		defer os.RemoveAll(tempDir)
+
+		// Mock expects Clone to be called with HEAD
+		mockRM.On("Clone", ctx, mock.Anything, "HEAD").Return(&git.Repo{
+			Directory:  tempDir,
+			BranchName: "main",
+			CloneURL:   cloneURL,
+			Config:     cfg,
+		}, nil)
+
+		ce := CheckEvent{
+			clonedRepos: make(map[repoKey]*git.Repo),
+			repoManager: mockRM,
+			ctr:         container.Container{VcsClient: vcsClient},
+		}
+
+		repo, err := ce.getRepo(ctx, cloneURL, "HEAD")
+		require.NoError(t, err)
+		assert.Equal(t, "main", repo.BranchName)
+		assert.Len(t, ce.clonedRepos, 2)
+		assert.Contains(t, ce.clonedRepos, generateRepoKey(canonical, "HEAD"))
+		assert.Contains(t, ce.clonedRepos, generateRepoKey(canonical, "main"))
+		mockRM.AssertExpectations(t)
+	})
+
+	t.Run("branch is the same as HEAD", func(t *testing.T) {
+		vcsClient := new(vcsmocks.MockClient)
+		vcsClient.EXPECT().Username().Return("username")
+		vcsClient.EXPECT().CloneUsername().Return("clone-username")
+
+		// Create mock repo manager
+		mockRM := new(mockRepoManager)
+
+		// Create a real git repo for testing
+		tempDir := createTestGitRepo(t, "main")
+		defer os.RemoveAll(tempDir)
+
+		// Mock expects Clone to be called with "main"
+		mockRM.On("Clone", ctx, mock.Anything, "main").Return(&git.Repo{
+			Directory:  tempDir,
+			BranchName: "main",
+			CloneURL:   cloneURL,
+			Config:     cfg,
+		}, nil)
+
+		ce := CheckEvent{
+			clonedRepos: make(map[repoKey]*git.Repo),
+			repoManager: mockRM,
+			ctr:         container.Container{VcsClient: vcsClient},
+		}
+
+		repo, err := ce.getRepo(ctx, cloneURL, "main")
+		require.NoError(t, err)
+		assert.Equal(t, "main", repo.BranchName)
+		assert.Len(t, ce.clonedRepos, 2)
+		assert.Contains(t, ce.clonedRepos, generateRepoKey(canonical, "HEAD"))
+		assert.Contains(t, ce.clonedRepos, generateRepoKey(canonical, "main"))
+		mockRM.AssertExpectations(t)
+	})
+
+	t.Run("branch is not the same as HEAD", func(t *testing.T) {
+		vcsClient := new(vcsmocks.MockClient)
+		vcsClient.EXPECT().Username().Return("username")
+		vcsClient.EXPECT().CloneUsername().Return("clone-username")
+
+		// Create mock repo manager
+		mockRM := new(mockRepoManager)
+
+		// Create a real git repo for testing
+		tempDir := createTestGitRepo(t, "gh-pages")
+		defer os.RemoveAll(tempDir)
+
+		// Mock expects Clone to be called with "gh-pages"
+		mockRM.On("Clone", ctx, mock.Anything, "gh-pages").Return(&git.Repo{
+			Directory:  tempDir,
+			BranchName: "gh-pages",
+			CloneURL:   cloneURL,
+			Config:     cfg,
+		}, nil)
+
+		ce := CheckEvent{
+			clonedRepos: make(map[repoKey]*git.Repo),
+			repoManager: mockRM,
+			ctr:         container.Container{VcsClient: vcsClient},
+		}
+
+		repo, err := ce.getRepo(ctx, cloneURL, "gh-pages")
+		require.NoError(t, err)
+		assert.Equal(t, "gh-pages", repo.BranchName)
+		assert.Len(t, ce.clonedRepos, 1)
+		assert.Contains(t, ce.clonedRepos, generateRepoKey(canonical, "gh-pages"))
+		mockRM.AssertExpectations(t)
+	})
+}
+
+func TestCheckEvent_GenerateListOfAffectedApps(t *testing.T) {
+	type fields struct {
+		fileList      []string
+		pullRequest   vcs.PullRequest
+		logger        zerolog.Logger
+		vcsNote       *msg.Message
+		affectedItems affected_apps.AffectedItems
+		ctr           container.Container
+		repoManager   repoManager
+		processors    []checks.ProcessorEntry
+		clonedRepos   map[repoKey]*git.Repo
+		addedAppsSet  map[string]v1alpha1.Application
+		appsSent      int32
+		appChannel    chan *v1alpha1.Application
+		generator     generator.AppsGenerator
+		matcher       affected_apps.Matcher
+	}
+	type args struct {
+		ctx           context.Context
+		repo          *git.Repo
+		targetBranch  string
+		initMatcherFn MatcherFn
+	}
+	tests := []struct {
+		name             string
+		fields           fields
+		args             args
+		expectedAppCount int
+		wantErr          assert.ErrorAssertionFunc
+	}{
+		// TODO: Add test cases.
+		{
+			name: "no error",
+			fields: fields{
+				fileList:      nil,
+				pullRequest:   vcs.PullRequest{},
+				logger:        zerolog.Logger{},
+				vcsNote:       nil,
+				affectedItems: affected_apps.AffectedItems{},
+				ctr:           container.Container{},
+				repoManager:   nil,
+				processors:    nil,
+				clonedRepos:   nil,
+				addedAppsSet:  nil,
+				appsSent:      0,
+				appChannel:    nil,
+				generator:     MockGenerator("GenerateApplicationSetApps", []interface{}{[]v1alpha1.Application{}, nil}),
+				matcher: MockMatcher("AffectedApps", []interface{}{
+					affected_apps.AffectedItems{
+						ApplicationSets: []v1alpha1.ApplicationSet{
+							{
+								TypeMeta:   metav1.TypeMeta{Kind: "ApplicationSet", APIVersion: "argoproj.io/v1alpha1"},
+								ObjectMeta: metav1.ObjectMeta{Name: "appset1"},
+							},
+						},
+					},
+					nil,
+				}),
+			},
+			args: args{
+				ctx:           context.Background(),
+				repo:          &git.Repo{Directory: "/tmp"},
+				targetBranch:  "HEAD",
+				initMatcherFn: MockInitMatcherFn(),
+			},
+			expectedAppCount: 1,
+			wantErr:          assert.NoError,
+		},
+		{
+			name: "matcher error",
+			fields: fields{
+				fileList:      nil,
+				pullRequest:   vcs.PullRequest{},
+				logger:        zerolog.Logger{},
+				vcsNote:       nil,
+				affectedItems: affected_apps.AffectedItems{},
+				ctr:           container.Container{},
+				repoManager:   nil,
+				processors:    nil,
+				clonedRepos:   nil,
+				addedAppsSet:  nil,
+				appsSent:      0,
+				appChannel:    nil,
+				generator:     MockGenerator("GenerateApplicationSetApps", []interface{}{[]v1alpha1.Application{}, nil}),
+				matcher: MockMatcher("AffectedApps", []interface{}{
+					affected_apps.AffectedItems{},
+					fmt.Errorf("mock error"),
+				}),
+			},
+			args: args{
+				ctx:           context.Background(),
+				repo:          &git.Repo{Directory: "/tmp"},
+				targetBranch:  "HEAD",
+				initMatcherFn: MockInitMatcherFn(),
+			},
+			expectedAppCount: 0,
+			wantErr:          assert.Error,
+		},
+		{
+			name: "generator error",
+			fields: fields{
+				fileList:      nil,
+				pullRequest:   vcs.PullRequest{},
+				logger:        zerolog.Logger{},
+				vcsNote:       nil,
+				affectedItems: affected_apps.AffectedItems{},
+				ctr:           container.Container{},
+				repoManager:   nil,
+				processors:    nil,
+				clonedRepos:   nil,
+				addedAppsSet:  nil,
+				appsSent:      0,
+				appChannel:    nil,
+				generator:     MockGenerator("GenerateApplicationSetApps", []interface{}{[]v1alpha1.Application{}, fmt.Errorf("mock error")}),
+				matcher: MockMatcher("AffectedApps", []interface{}{
+					affected_apps.AffectedItems{
+						ApplicationSets: []v1alpha1.ApplicationSet{
+							{
+								TypeMeta:   metav1.TypeMeta{Kind: "ApplicationSet", APIVersion: "argoproj.io/v1alpha1"},
+								ObjectMeta: metav1.ObjectMeta{Name: "appset1"},
+							},
+						},
+					},
+					nil,
+				}),
+			},
+			args: args{
+				ctx:           context.Background(),
+				repo:          &git.Repo{Directory: "/tmp"},
+				targetBranch:  "HEAD",
+				initMatcherFn: MockInitMatcherFn(),
+			},
+			expectedAppCount: 0,
+			wantErr:          assert.NoError,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ce := &CheckEvent{
+				fileList:      tt.fields.fileList,
+				pullRequest:   tt.fields.pullRequest,
+				logger:        tt.fields.logger,
+				vcsNote:       tt.fields.vcsNote,
+				affectedItems: tt.fields.affectedItems,
+				ctr:           tt.fields.ctr,
+				repoManager:   tt.fields.repoManager,
+				processors:    tt.fields.processors,
+				clonedRepos:   tt.fields.clonedRepos,
+				addedAppsSet:  tt.fields.addedAppsSet,
+				appsSent:      tt.fields.appsSent,
+				appChannel:    tt.fields.appChannel,
+				generator:     tt.fields.generator,
+				matcher:       tt.fields.matcher,
+			}
+			tt.wantErr(t, ce.GenerateListOfAffectedApps(tt.args.ctx, tt.args.repo, tt.args.targetBranch, tt.args.initMatcherFn), fmt.Sprintf("GenerateListOfAffectedApps(%v, %v, %v, %v)", tt.args.ctx, tt.args.repo, tt.args.targetBranch, tt.args.initMatcherFn))
+
+		})
+	}
+}
+
+func TestPostReport(t *testing.T) {
+	const noteID = 42
+
+	tests := []struct {
+		name              string
+		announceNoChanges bool
+		results           []msg.Result
+		wantDeleted       bool
+		wantChunk         string
+	}{
+		{
+			name:              "no changes, announced",
+			announceNoChanges: true,
+			results:           []msg.Result{{NoChangesDetected: true, Summary: "No changes"}},
+			wantChunk:         "# Kubechecks test Report\nNo changes\n\n<small> _Done. CommitSHA: sha_ <small>\n",
+		},
+		{
+			name:              "no changes, not announced",
+			announceNoChanges: false,
+			results:           []msg.Result{{NoChangesDetected: true, Summary: "No changes"}},
+			wantDeleted:       true,
+		},
+		{
+			name:              "changes, not announced",
+			announceNoChanges: false,
+			results:           []msg.Result{{State: pkg.StateSuccess, Summary: "1 added, 0 modified, 0 removed"}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.TODO()
+
+			vcsClient := new(vcsmocks.MockClient)
+			vcsClient.EXPECT().ToEmoji(mock.Anything).Return(":emoji:").Maybe()
+			vcsClient.EXPECT().MaxCommentLength().Return(64 * 1024).Maybe()
+
+			pr := vcs.PullRequest{SHA: "sha"}
+			note := msg.NewMessage("repo", 1, noteID, vcsClient)
+			note.AddNewApp(ctx, "some-app")
+			for _, result := range tt.results {
+				note.AddToAppMessage(ctx, "some-app", result)
+			}
+
+			if tt.wantDeleted {
+				vcsClient.EXPECT().DeleteMessage(ctx, pr, noteID).Return(nil).Once()
+			} else {
+				vcsClient.EXPECT().UpdateMessage(ctx, pr, noteID, mock.Anything).
+					Run(func(_ context.Context, _ vcs.PullRequest, _ int, chunks []string) {
+						require.Len(t, chunks, 1)
+						if tt.wantChunk != "" {
+							assert.Equal(t, tt.wantChunk, chunks[0])
+						}
+					}).Return(nil).Once()
+			}
+
+			ce := CheckEvent{
+				pullRequest: pr,
+				vcsNote:     note,
+				ctr: container.Container{
+					VcsClient: vcsClient,
+					Config: config.ServerConfig{
+						AnnounceNoChanges: tt.announceNoChanges,
+						Identifier:        "test",
+					},
+				},
+			}
+
+			require.NoError(t, ce.postReport(ctx, time.Now()))
+			vcsClient.AssertExpectations(t)
+		})
+	}
+}
+
+func MockMatcher(methodName string, returns []interface{}) affected_apps.Matcher {
+	mockClient := new(affectedappsmocks.MockMatcher)
+	mockClient.On(methodName, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(returns...)
+
+	return mockClient
+}
+
+func MockGenerator(methodName string, returns []interface{}) generator.AppsGenerator {
+	mockClient := new(generatorsmocks.MockAppsGenerator)
+	mockClient.On(methodName, mock.Anything, mock.Anything, mock.Anything).Return(returns...)
+
+	return mockClient
+}
+
+func MockInitMatcherFn() MatcherFn {
+	return func(ce *CheckEvent, repo *git.Repo) error {
+		return nil
+	}
+}
